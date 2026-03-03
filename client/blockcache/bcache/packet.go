@@ -108,13 +108,11 @@ func (req *PutCacheRequest) UnmarshalValue(data []byte) (err error) {
 	if err != nil {
 		return err
 	}
-	dataBytes := bytespool.Alloc(int(dataLen))
-	defer bytespool.Free(dataBytes)
-	err = binary.Read(reader, binary.BigEndian, &dataBytes)
+	req.Data = make([]byte, dataLen)
+	_, err = reader.Read(req.Data)
 	if err != nil {
 		return err
 	}
-	req.Data = dataBytes
 
 	var volNameLen uint32
 	err = binary.Read(reader, binary.BigEndian, &volNameLen)
