@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"container/list"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
@@ -33,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cubefs/cubefs/util/bytespool"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
@@ -139,8 +141,17 @@ type bcacheManager struct {
 }
 
 func encryptXOR(data []byte) {
-	for index, value := range data {
-		data[index] = value ^ byte(0xF)
+	const xorWord = uint64(0x0F0F0F0F0F0F0F0F)
+	n := len(data)
+	// process 8 bytes at a time
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		v := binary.LittleEndian.Uint64(data[i:])
+		binary.LittleEndian.PutUint64(data[i:], v^xorWord)
+	}
+	// process remaining bytes
+	for ; i < n; i++ {
+		data[i] ^= 0xF
 	}
 }
 
@@ -150,9 +161,9 @@ func (bm *bcacheManager) queryCachePath(key string, offset uint64, len uint32) (
 		stat.EndStat("GetCache:GetCachePath", err, bgTime, 1)
 	}()
 
-	bm.Lock()
+	bm.RLock()
 	element, ok := bm.bcacheKeys[key]
-	bm.Unlock()
+	bm.RUnlock()
 	if ok {
 		item := element.Value.(*cacheItem)
 		path, err := bm.getCachePath(key)
@@ -220,9 +231,9 @@ func (bm *bcacheManager) read(key string, offset uint64, len uint32) (io.ReadClo
 		}
 	}()
 	metaBgTime := stat.BeginStat()
-	bm.Lock()
+	bm.RLock()
 	element, ok := bm.bcacheKeys[key]
-	bm.Unlock()
+	bm.RUnlock()
 	stat.EndStat("GetCache:Read:GetMeta", nil, metaBgTime, 1)
 	log.LogDebugf("Trace read. ok =%v", ok)
 	if ok {
@@ -614,9 +625,12 @@ func (d *DiskStore) flushKey(vol, key string, data []byte) error {
 		log.LogWarnf("Create block tmp file:%s err:%s!", tmp, err)
 		return err
 	}
-	// encrypt
-	encryptXOR(data)
-	_, err = f.Write(data)
+	// encrypt: copy data to avoid modifying caller's buffer
+	encrypted := bytespool.Alloc(len(data))
+	copy(encrypted, data)
+	encryptXOR(encrypted)
+	_, err = f.Write(encrypted)
+	bytespool.Free(encrypted)
 	if err != nil {
 		f.Close()
 		log.LogErrorf("Write tmp failed: file %s err %s!", tmp, err)
