@@ -43,6 +43,7 @@ const (
 	BlockSize     = "blockSize"
 	Vol           = "vol"
 	Cluster       = "Cluster"
+	CacheEncrypt  = "cacheEncrypt"
 	MaxFileSize   = 128 << 30
 	MaxBlockSize  = 128 << 20
 	BigExtentSize = 32 << 20
@@ -56,6 +57,7 @@ type bcacheConfig struct {
 	FreeRatio float32
 	Limit     uint32
 	Vol       string
+	Encrypt   bool
 }
 
 type bcacheStore struct {
@@ -322,5 +324,6 @@ func (s *bcacheStore) parserConf(cfg *config.Config) (*bcacheConfig, error) {
 	if v, err := strconv.ParseFloat(cacheFree, 32); err == nil {
 		bconf.FreeRatio = float32(v)
 	}
+	bconf.Encrypt = cfg.GetBoolWithDefault(CacheEncrypt, true)
 	return bconf, nil
 }

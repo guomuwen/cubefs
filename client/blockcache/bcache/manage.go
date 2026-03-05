@@ -93,23 +93,28 @@ func newBcacheManager(conf *bcacheConfig) BcacheManager {
 
 	bm := &bcacheManager{
 		bstore:         make([]*DiskStore, len(cacheDirs)),
-		bcacheKeys:     make(map[string]*list.Element),
-		lrulist:        list.New(),
 		blockSize:      conf.BlockSize,
-		pending:        make(chan waitFlush, 1024),
+		pending:        make(chan waitFlush, 4096),
 		cacheMetaCount: exporter.NewGaugeVec("bcache_meta_count", "", []string{"volName", "disk", "type"}),
 		vol:            conf.Vol,
+		encrypt:        conf.Encrypt,
+	}
+	for i := range bm.shards {
+		bm.shards[i].keys = make(map[string]*list.Element)
+		bm.shards[i].lrulist = list.New()
 	}
 	index := 0
 	for cacheDir, cacheSize := range dirSizeMap {
+		bm.checkEncryptMode(cacheDir, conf.Encrypt)
 		disk := NewDiskStore(cacheDir, cacheSize, conf)
 		bm.bstore[index] = disk
 		go bm.reBuildCacheKeys(cacheDir, disk)
 		index++
 	}
 	go bm.spaceManager()
-	go bm.flush()
-	// go bm.scrub()
+	for i := 0; i < flushWorkerCount; i++ {
+		go bm.flush()
+	}
 	return bm
 }
 
@@ -129,15 +134,29 @@ type waitFlush struct {
 	Data []byte
 }
 
-type bcacheManager struct {
+const (
+	flushWorkerCount = 8
+	lruShardCount    = 64
+)
+
+type lruShard struct {
 	sync.RWMutex
-	bcacheKeys     map[string]*list.Element
-	lrulist        *list.List
+	keys    map[string]*list.Element
+	lrulist *list.List
+}
+
+type bcacheManager struct {
+	shards         [lruShardCount]lruShard
 	bstore         []*DiskStore
 	blockSize      uint32
 	pending        chan waitFlush
 	cacheMetaCount *exporter.GaugeVec
 	vol            string
+	encrypt        bool
+}
+
+func (bm *bcacheManager) getShard(key string) *lruShard {
+	return &bm.shards[hashKey(key)%lruShardCount]
 }
 
 func encryptXOR(data []byte) {
@@ -155,24 +174,48 @@ func encryptXOR(data []byte) {
 	}
 }
 
+func (bm *bcacheManager) checkEncryptMode(cacheDir string, encrypt bool) {
+	markerPath := filepath.Join(cacheDir, ".encrypt_mode")
+	currentMode := strconv.FormatBool(encrypt)
+	if f, err := os.Open(markerPath); err == nil {
+		buf := make([]byte, 16)
+		n, _ := f.Read(buf)
+		f.Close()
+		if n > 0 {
+			oldMode := strings.TrimSpace(string(buf[:n]))
+			if oldMode != currentMode {
+				log.LogWarnf("encrypt mode changed from %s to %s, clearing cache dir %s", oldMode, currentMode, cacheDir)
+				blocksDir := filepath.Join(cacheDir, Basedir)
+				os.RemoveAll(blocksDir)
+			}
+		}
+	}
+	os.MkdirAll(cacheDir, os.FileMode(FilePerm))
+	if f, err := os.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(FilePerm)); err == nil {
+		f.Write([]byte(currentMode))
+		f.Close()
+	}
+}
+
 func (bm *bcacheManager) queryCachePath(key string, offset uint64, len uint32) (path string, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("GetCache:GetCachePath", err, bgTime, 1)
 	}()
 
-	bm.RLock()
-	element, ok := bm.bcacheKeys[key]
-	bm.RUnlock()
+	shard := bm.getShard(key)
+	shard.RLock()
+	element, ok := shard.keys[key]
+	shard.RUnlock()
 	if ok {
 		item := element.Value.(*cacheItem)
 		path, err := bm.getCachePath(key)
 		if err != nil {
 			return "", err
 		}
-		bm.Lock()
-		bm.lrulist.MoveToBack(element)
-		bm.Unlock()
+		shard.Lock()
+		shard.lrulist.MoveToBack(element)
+		shard.Unlock()
 		log.LogDebugf("Cache item found. key=%v offset =%v,len=%v size=%v, path=%v", key, offset, len, item.size, path)
 		return path, nil
 	}
@@ -209,15 +252,16 @@ func (bm *bcacheManager) cache(vol, key string, data []byte, direct bool) {
 
 func (bm *bcacheManager) cacheDirect(vol, key string, data []byte) {
 	diskKv := bm.selectDiskKv(key)
-	if diskKv.flushKey(vol, key, data) == nil {
-		bm.Lock()
+	if diskKv.flushKey(vol, key, data, bm.encrypt) == nil {
+		shard := bm.getShard(key)
+		shard.Lock()
 		item := &cacheItem{
 			key:  key,
 			size: uint32(len(data)),
 		}
-		element := bm.lrulist.PushBack(item)
-		bm.bcacheKeys[key] = element
-		bm.Unlock()
+		element := shard.lrulist.PushBack(item)
+		shard.keys[key] = element
+		shard.Unlock()
 	}
 }
 
@@ -231,18 +275,19 @@ func (bm *bcacheManager) read(key string, offset uint64, len uint32) (io.ReadClo
 		}
 	}()
 	metaBgTime := stat.BeginStat()
-	bm.RLock()
-	element, ok := bm.bcacheKeys[key]
-	bm.RUnlock()
+	shard := bm.getShard(key)
+	shard.RLock()
+	element, ok := shard.keys[key]
+	shard.RUnlock()
 	stat.EndStat("GetCache:Read:GetMeta", nil, metaBgTime, 1)
 	log.LogDebugf("Trace read. ok =%v", ok)
 	if ok {
 		item := element.Value.(*cacheItem)
 		f, err := bm.load(key)
 		if os.IsNotExist(err) {
-			bm.Lock()
-			delete(bm.bcacheKeys, key)
-			bm.Unlock()
+			shard.Lock()
+			delete(shard.keys, key)
+			shard.Unlock()
 			d := bm.selectDiskKv(key)
 			atomic.AddInt64(&d.usedSize, -int64(item.size))
 			atomic.AddInt64(&d.usedCount, -1)
@@ -264,8 +309,9 @@ func (bm *bcacheManager) read(key string, offset uint64, len uint32) (io.ReadClo
 		if err != nil {
 			return nil, err
 		} else {
-			// decrypt
-			encryptXOR(buf[:n])
+			if bm.encrypt {
+				encryptXOR(buf[:n])
+			}
 			return io.NopCloser(bytes.NewBuffer(buf[:n])), nil
 		}
 	} else {
@@ -282,11 +328,12 @@ func (bm *bcacheManager) load(key string) (ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	bm.Lock()
-	defer bm.Unlock()
-	if element, ok := bm.bcacheKeys[key]; ok {
-		bm.lrulist.MoveToBack(element)
+	shard := bm.getShard(key)
+	shard.Lock()
+	if element, ok := shard.keys[key]; ok {
+		shard.lrulist.MoveToBack(element)
 	}
+	shard.Unlock()
 	return f, err
 }
 
@@ -296,12 +343,13 @@ func (bm *bcacheManager) erase(key string) {
 	}
 	err := bm.selectDiskKv(key).remove(key)
 	if err == nil {
-		bm.Lock()
-		defer bm.Unlock()
-		if element, ok := bm.bcacheKeys[key]; ok {
-			bm.lrulist.Remove(element)
+		shard := bm.getShard(key)
+		shard.Lock()
+		if element, ok := shard.keys[key]; ok {
+			shard.lrulist.Remove(element)
 		}
-		delete(bm.bcacheKeys, key)
+		delete(shard.keys, key)
+		shard.Unlock()
 	}
 }
 
@@ -400,34 +448,37 @@ func (bm *bcacheManager) freeSpace(store *DiskStore, free float32, files int64) 
 	}
 
 	cnt := 0
-	for {
-		if decreaseCnt <= 0 && decreaseSpace <= 0 {
-			break
-		}
-		// avoid dead loop
+	for decreaseCnt > 0 || decreaseSpace > 0 {
 		if cnt > 500000 {
 			break
 		}
-		bm.Lock()
-
-		element := bm.lrulist.Front()
-		if element == nil {
-			bm.Unlock()
-			return
+		evicted := false
+		for i := range bm.shards {
+			if decreaseCnt <= 0 && decreaseSpace <= 0 {
+				break
+			}
+			shard := &bm.shards[i]
+			shard.Lock()
+			element := shard.lrulist.Front()
+			if element == nil {
+				shard.Unlock()
+				continue
+			}
+			item := element.Value.(*cacheItem)
+			if err := store.remove(item.key); err == nil {
+				shard.lrulist.Remove(element)
+				delete(shard.keys, item.key)
+				decreaseSpace -= int64(item.size)
+				decreaseCnt--
+				cnt++
+				evicted = true
+				log.LogDebugf("remove %v from cache", item.key)
+			}
+			shard.Unlock()
 		}
-		item := element.Value.(*cacheItem)
-
-		if err := store.remove(item.key); err == nil {
-			bm.lrulist.Remove(element)
-			delete(bm.bcacheKeys, item.key)
-			decreaseSpace -= int64(item.size)
-			decreaseCnt--
-			cnt++
+		if !evicted {
+			break
 		}
-
-		bm.Unlock()
-		log.LogDebugf("remove %v from cache", item.key)
-
 	}
 }
 
@@ -445,10 +496,11 @@ func (bm *bcacheManager) reBuildCacheKeys(dir string, store *DiskStore) {
 	}()
 
 	for value := range c {
-		bm.Lock()
-		element := bm.lrulist.PushBack(value.it)
-		bm.bcacheKeys[value.key] = element
-		bm.Unlock()
+		shard := bm.getShard(value.key)
+		shard.Lock()
+		element := shard.lrulist.PushBack(value.it)
+		shard.keys[value.key] = element
+		shard.Unlock()
 		log.LogDebugf("updateStat(%v)", value.it.size)
 		store.updateStat(value.it.size)
 	}
@@ -487,15 +539,16 @@ func (bm *bcacheManager) flush() {
 		pending := <-bm.pending
 		diskKv := bm.selectDiskKv(pending.Key)
 		log.LogDebugf("flush data,key(%v), dir(%v)", pending.Key, diskKv.dir)
-		if diskKv.flushKey(bm.vol, pending.Key, pending.Data) == nil {
-			bm.Lock()
+		if diskKv.flushKey(bm.vol, pending.Key, pending.Data, bm.encrypt) == nil {
+			shard := bm.getShard(pending.Key)
+			shard.Lock()
 			item := &cacheItem{
 				key:  pending.Key,
 				size: uint32(len(pending.Data)),
 			}
-			element := bm.lrulist.PushBack(item)
-			bm.bcacheKeys[pending.Key] = element
-			bm.Unlock()
+			element := shard.lrulist.PushBack(item)
+			shard.keys[pending.Key] = element
+			shard.Unlock()
 		}
 	}
 }
@@ -602,7 +655,7 @@ func (d *DiskStore) checkBuildCacheDir(dir string) {
 //
 //}
 
-func (d *DiskStore) flushKey(vol, key string, data []byte) error {
+func (d *DiskStore) flushKey(vol, key string, data []byte, encrypt bool) error {
 	var err error
 	bgTime := stat.BeginStat()
 	metric := exporter.NewTPCnt("cacheToDisk")
@@ -625,12 +678,15 @@ func (d *DiskStore) flushKey(vol, key string, data []byte) error {
 		log.LogWarnf("Create block tmp file:%s err:%s!", tmp, err)
 		return err
 	}
-	// encrypt: copy data to avoid modifying caller's buffer
-	encrypted := bytespool.Alloc(len(data))
-	copy(encrypted, data)
-	encryptXOR(encrypted)
-	_, err = f.Write(encrypted)
-	bytespool.Free(encrypted)
+	if encrypt {
+		encrypted := bytespool.Alloc(len(data))
+		copy(encrypted, data)
+		encryptXOR(encrypted)
+		_, err = f.Write(encrypted)
+		bytespool.Free(encrypted)
+	} else {
+		_, err = f.Write(data)
+	}
 	if err != nil {
 		f.Close()
 		log.LogErrorf("Write tmp failed: file %s err %s!", tmp, err)
