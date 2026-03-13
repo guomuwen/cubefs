@@ -1086,8 +1086,23 @@ func (mw *MetaWrapper) iget(mp *MetaPartition, inode uint64, verSeq uint64) (sta
 	return statusOK, resp.Info, nil
 }
 
+const batchIgetMaxPerRPC = 10000 // limit per-RPC batch to avoid multi-second blocking
+
 func (mw *MetaWrapper) batchIget(wg *sync.WaitGroup, mp *MetaPartition, inodes []uint64, respCh chan []*proto.InodeInfo) {
 	defer wg.Done()
+
+	// Split into sub-batches to avoid oversized single RPC
+	for start := 0; start < len(inodes); start += batchIgetMaxPerRPC {
+		end := start + batchIgetMaxPerRPC
+		if end > len(inodes) {
+			end = len(inodes)
+		}
+		batch := inodes[start:end]
+		mw.batchIgetOnce(mp, batch, respCh)
+	}
+}
+
+func (mw *MetaWrapper) batchIgetOnce(mp *MetaPartition, inodes []uint64, respCh chan []*proto.InodeInfo) {
 	var err error
 
 	bgTime := stat.BeginStat()
@@ -1102,7 +1117,7 @@ func (mw *MetaWrapper) batchIget(wg *sync.WaitGroup, mp *MetaPartition, inodes [
 		VerSeq:      mw.VerReadSeq,
 		InnerReq:    mw.InnerReq,
 	}
-	log.LogDebugf("action[batchIget] req %v", req)
+	log.LogDebugf("action[batchIget] req inodes(%d) partitionID(%d)", len(inodes), mp.PartitionID)
 	packet := proto.NewPacketReqID()
 	packet.Opcode = proto.OpMetaBatchInodeGet
 	packet.PartitionID = mp.PartitionID
@@ -1135,7 +1150,7 @@ func (mw *MetaWrapper) batchIget(wg *sync.WaitGroup, mp *MetaPartition, inodes [
 		log.LogErrorf("batchIget: packet(%v) mp(%v) err(%v) PacketData(%v)", packet, mp, err, string(packet.Data))
 		return
 	}
-	log.LogDebugf("action[batchIget] resp %v", resp)
+	log.LogDebugf("action[batchIget] resp infos(%d)", len(resp.Infos))
 	if len(resp.Infos) == 0 {
 		return
 	}

@@ -103,27 +103,37 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	s.inode = inode
 	s.parentInode = 0
 	s.extents = NewExtentCache(inode)
+	// Restore cached ExtentCache from pool to avoid getExtents RPC on re-open
+	if cached := client.TakeExtentCache(inode); cached != nil {
+		s.extents = cached
+		log.LogDebugf("NewStreamer: restored ExtentCache from pool for ino(%v) gen(%v)", inode, cached.gen)
+	}
 	s.request = make(chan interface{}, reqChanSize)
 	s.done = make(chan struct{})
 	s.dirtylist = NewDirtyExtentList()
 	s.isOpen = true
-	s.pendingCache = make(chan bcacheKey, 1)
 	s.verSeq = client.multiVerMgr.latestVerSeq
 	s.extents.verSeq = client.multiVerMgr.latestVerSeq
 	s.openForWrite = openForWrite
 	s.isCache = isCache
 	s.fullPath = fullPath
 
-	// Initialize async flush fields
-	s.asyncFlushCh = make(chan *AsyncFlushRequest, asyncFlushQueueSize)
-	s.asyncFlushDone = make(chan struct{})
-	s.asyncFlushSemaphore = make(chan struct{}, asyncFlushSemaphoreSize)
+	if s.openForWrite {
+		// Only allocate write-related channels for write streamers
+		s.pendingCache = make(chan bcacheKey, 1)
+		s.asyncFlushCh = make(chan *AsyncFlushRequest, asyncFlushQueueSize)
+		s.asyncFlushDone = make(chan struct{})
+		s.asyncFlushSemaphore = make(chan struct{}, asyncFlushSemaphoreSize)
+	} else {
+		// Read-only streamers: pendingCache with non-blocking send (default branch)
+		s.pendingCache = make(chan bcacheKey, 1)
+	}
 
 	// Initialize local async flush tracking map
 	// sync.Map is zero value ready, no initialization needed
 
 	if log.EnableDebug() {
-		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d", s, reqChanSize)
+		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d, openForWrite %v", s, reqChanSize, openForWrite)
 	}
 	if s.openForWrite {
 		err := s.client.forbiddenMigration(s.inode)
@@ -143,8 +153,14 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 		}
 	}
 	go s.server()
-	go s.asyncBlockCache()
-	go s.asyncFlushManager() // Start async flush manager
+	// Only start asyncBlockCache and asyncFlushManager for write streamers
+	// to reduce per-streamer memory (2 fewer goroutines × ~4KB stack each).
+	// For read-only streamers, asyncBlockCache is started on-demand when needed,
+	// and asyncFlushManager is not needed at all.
+	if s.openForWrite {
+		go s.asyncBlockCache()
+		go s.asyncFlushManager()
+	}
 	return s
 }
 

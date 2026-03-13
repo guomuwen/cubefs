@@ -185,6 +185,7 @@ type ExtentClient struct {
 	streamerList       *list.List
 	streamerLock       sync.Mutex
 	maxStreamerLimit   int
+	extentCachePool    map[uint64]*ExtentCache // survives Streamer eviction to avoid getExtents on re-open
 	readLimiter        *rate.Limiter
 	writeLimiter       *rate.Limiter
 	disableMetaCache   bool
@@ -264,8 +265,22 @@ func (client *ExtentClient) evictStreamer() bool {
 		return true
 	}
 
+	// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+	if s.extents != nil && s.extents.gen > 0 {
+		client.extentCachePool[s.inode] = s.extents
+	}
 	delete(s.client.streamers, s.inode)
 	return true
+}
+
+// TakeExtentCache retrieves and removes a cached ExtentCache from the pool.
+// Must be called under streamerLock protection.
+func (client *ExtentClient) TakeExtentCache(inode uint64) *ExtentCache {
+	if ec, ok := client.extentCachePool[inode]; ok {
+		delete(client.extentCachePool, inode)
+		return ec
+	}
+	return nil
 }
 
 func (client *ExtentClient) batchEvictStramer(batchCnt int) {
@@ -332,6 +347,7 @@ retry:
 	}
 
 	client.streamers = make(map[uint64]*Streamer)
+	client.extentCachePool = make(map[uint64]*ExtentCache)
 	client.multiVerMgr = &MultiVerMgr{verList: &proto.VolVersionInfoList{}}
 
 	client.appendExtentKey = config.OnAppendExtentKey
@@ -572,12 +588,14 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 	s.needBCache = needBCache
 	if !s.isOpen && !client.disableMetaCache {
 		s.isOpen = true
-		log.LogDebugf("open stream again, ino(%v)", s.inode)
+		log.LogDebugf("open stream again, ino(%v) openForWrite(%v)", s.inode, s.openForWrite)
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
-		go s.asyncBlockCache()
-		go s.asyncFlushManager()
+		if s.openForWrite {
+			go s.asyncBlockCache()
+			go s.asyncFlushManager()
+		}
 	}
 	return s.IssueOpenRequest()
 }
@@ -622,6 +640,10 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 		}
 
 		if s.client.disableMetaCache || !s.needBCache {
+			// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+			if s.extents != nil && s.extents.gen > 0 {
+				client.extentCachePool[s.inode] = s.extents
+			}
 			delete(s.client.streamers, s.inode)
 		}
 		return nil
@@ -635,6 +657,10 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 		s.done <- struct{}{}
 		s.isOpen = false
 	} else {
+		// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+		if s.extents != nil && s.extents.gen > 0 {
+			client.extentCachePool[s.inode] = s.extents
+		}
 		delete(s.client.streamers, s.inode)
 		s.client.streamerLock.Unlock()
 	}
@@ -903,8 +929,10 @@ func (client *ExtentClient) GetStreamer(inode uint64) *Streamer {
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
-		go s.asyncBlockCache()
-		go s.asyncFlushManager()
+		if s.openForWrite {
+			go s.asyncBlockCache()
+			go s.asyncFlushManager()
+		}
 
 		if client.AheadRead != nil && s.aheadReadWindow != nil {
 			go s.aheadReadWindow.backgroundAheadReadTask()
