@@ -608,8 +608,8 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
+		go s.asyncBlockCache()
 		if s.openForWrite {
-			go s.asyncBlockCache()
 			go s.asyncFlushManager()
 		}
 	}
@@ -941,8 +941,8 @@ func (client *ExtentClient) GetStreamer(inode uint64) *Streamer {
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
+		go s.asyncBlockCache()
 		if s.openForWrite {
-			go s.asyncBlockCache()
 			go s.asyncFlushManager()
 		}
 
