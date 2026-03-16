@@ -153,12 +153,8 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 		}
 	}
 	go s.server()
-	// Only start asyncBlockCache and asyncFlushManager for write streamers
-	// to reduce per-streamer memory (2 fewer goroutines × ~4KB stack each).
-	// For read-only streamers, asyncBlockCache is started on-demand when needed,
-	// and asyncFlushManager is not needed at all.
+	go s.asyncBlockCache()
 	if s.openForWrite {
-		go s.asyncBlockCache()
 		go s.asyncFlushManager()
 	}
 	return s
