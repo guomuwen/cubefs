@@ -15,6 +15,7 @@
 package bcache
 
 import (
+	"container/list"
 	"hash/crc32"
 	"os"
 	"strings"
@@ -83,13 +84,20 @@ func (pc *pathCache) remove(key string) {
 
 const (
 	fdCacheShards      = 32
-	fdCacheMaxPerShard = 4096
+	fdCacheMaxPerShard = 32768 // 32 shards × 32768 = ~1M total FDs, covers 1M files/node
 )
+
+// fdCacheEntry holds a file descriptor and its LRU linked list element.
+type fdCacheEntry struct {
+	f    *os.File
+	path string
+	elem *list.Element
+}
 
 type fdCacheShard struct {
 	sync.RWMutex
-	items map[string]*os.File
-	order []string
+	items map[string]*fdCacheEntry
+	lru   *list.List // front = most recently used, back = least recently used
 }
 
 type fdCache struct {
@@ -99,8 +107,8 @@ type fdCache struct {
 func newFdCache() *fdCache {
 	fc := &fdCache{}
 	for i := range fc.shards {
-		fc.shards[i].items = make(map[string]*os.File)
-		fc.shards[i].order = make([]string, 0, fdCacheMaxPerShard)
+		fc.shards[i].items = make(map[string]*fdCacheEntry)
+		fc.shards[i].lru = list.New()
 	}
 	return fc
 }
@@ -111,10 +119,14 @@ func (fc *fdCache) getShard(key string) *fdCacheShard {
 
 func (fc *fdCache) getOrOpen(cachePath string) (*os.File, error) {
 	shard := fc.getShard(cachePath)
+
+	// Fast path: read lock only, skip LRU promotion to avoid write lock contention.
+	// With 32K capacity per shard (covering full working set), eviction is rare,
+	// so LRU accuracy is not critical on the hot path.
 	shard.RLock()
-	if f, ok := shard.items[cachePath]; ok {
+	if entry, ok := shard.items[cachePath]; ok {
 		shard.RUnlock()
-		return f, nil
+		return entry.f, nil
 	}
 	shard.RUnlock()
 
@@ -124,21 +136,27 @@ func (fc *fdCache) getOrOpen(cachePath string) (*os.File, error) {
 	}
 
 	shard.Lock()
+	// Double-check after acquiring write lock
 	if existing, ok := shard.items[cachePath]; ok {
 		shard.Unlock()
 		f.Close()
-		return existing, nil
+		return existing.f, nil
 	}
-	if len(shard.order) >= fdCacheMaxPerShard {
-		evictKey := shard.order[0]
-		shard.order = shard.order[1:]
-		if evictFile, ok := shard.items[evictKey]; ok {
-			evictFile.Close()
-			delete(shard.items, evictKey)
+	// Evict LRU entries if at capacity
+	for shard.lru.Len() >= fdCacheMaxPerShard {
+		tail := shard.lru.Back()
+		if tail == nil {
+			break
+		}
+		evictPath := tail.Value.(string)
+		shard.lru.Remove(tail)
+		if evictEntry, ok := shard.items[evictPath]; ok {
+			evictEntry.f.Close()
+			delete(shard.items, evictPath)
 		}
 	}
-	shard.items[cachePath] = f
-	shard.order = append(shard.order, cachePath)
+	elem := shard.lru.PushFront(cachePath)
+	shard.items[cachePath] = &fdCacheEntry{f: f, path: cachePath, elem: elem}
 	shard.Unlock()
 	return f, nil
 }
@@ -146,15 +164,12 @@ func (fc *fdCache) getOrOpen(cachePath string) (*os.File, error) {
 func (fc *fdCache) evict(cachePath string) {
 	shard := fc.getShard(cachePath)
 	shard.Lock()
-	if f, ok := shard.items[cachePath]; ok {
-		f.Close()
-		delete(shard.items, cachePath)
-		for i, k := range shard.order {
-			if k == cachePath {
-				shard.order = append(shard.order[:i], shard.order[i+1:]...)
-				break
-			}
+	if entry, ok := shard.items[cachePath]; ok {
+		entry.f.Close()
+		if entry.elem != nil {
+			shard.lru.Remove(entry.elem)
 		}
+		delete(shard.items, cachePath)
 	}
 	shard.Unlock()
 }
