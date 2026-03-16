@@ -266,9 +266,7 @@ func (client *ExtentClient) evictStreamer() bool {
 	}
 
 	// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
-	if s.extents != nil && s.extents.gen > 0 {
-		client.extentCachePool[s.inode] = s.extents
-	}
+	client.saveExtentCache(s.inode, s.extents)
 	delete(s.client.streamers, s.inode)
 	return true
 }
@@ -281,6 +279,24 @@ func (client *ExtentClient) TakeExtentCache(inode uint64) *ExtentCache {
 		return ec
 	}
 	return nil
+}
+
+// saveExtentCache stores an ExtentCache in the pool if it has valid data.
+// Enforces a size limit equal to maxStreamerLimit to prevent unbounded memory growth.
+// Must be called under streamerLock protection.
+func (client *ExtentClient) saveExtentCache(inode uint64, ec *ExtentCache) {
+	if ec == nil || ec.gen == 0 {
+		return
+	}
+	// Skip if pool is disabled (maxStreamerLimit not set)
+	if client.maxStreamerLimit <= 0 {
+		return
+	}
+	// Enforce size limit: if pool is full, skip saving (simple strategy, no LRU needed)
+	if len(client.extentCachePool) >= client.maxStreamerLimit {
+		return
+	}
+	client.extentCachePool[inode] = ec
 }
 
 func (client *ExtentClient) batchEvictStramer(batchCnt int) {
@@ -641,9 +657,7 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 
 		if s.client.disableMetaCache || !s.needBCache {
 			// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
-			if s.extents != nil && s.extents.gen > 0 {
-				client.extentCachePool[s.inode] = s.extents
-			}
+			client.saveExtentCache(s.inode, s.extents)
 			delete(s.client.streamers, s.inode)
 		}
 		return nil
@@ -658,9 +672,7 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 		s.isOpen = false
 	} else {
 		// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
-		if s.extents != nil && s.extents.gen > 0 {
-			client.extentCachePool[s.inode] = s.extents
-		}
+		client.saveExtentCache(s.inode, s.extents)
 		delete(s.client.streamers, s.inode)
 		s.client.streamerLock.Unlock()
 	}

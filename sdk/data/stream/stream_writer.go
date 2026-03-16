@@ -255,9 +255,7 @@ func (s *Streamer) server() {
 					if s.client.disableMetaCache || !s.needBCache {
 						log.LogDebugf("done server: delete streamer(%v)", s)
 						// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
-						if s.extents != nil && s.extents.gen > 0 {
-							s.client.extentCachePool[s.inode] = s.extents
-						}
+						s.client.saveExtentCache(s.inode, s.extents)
 						delete(s.client.streamers, s.inode)
 						if s.client.evictIcache != nil && s.openForWrite {
 							s.client.evictIcache(s.inode)
