@@ -1017,6 +1017,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.BufferChanSize = GlobalMountOptions[proto.BufferChanSize].GetInt64()
 	opt.MetaSendTimeout = GlobalMountOptions[proto.MetaSendTimeout].GetInt64()
 	opt.MaxStreamerLimit = GlobalMountOptions[proto.MaxStreamerLimit].GetInt64()
+	opt.ExtentCachePoolSize = GlobalMountOptions[proto.ExtentCachePoolSize].GetInt64()
 	opt.EnableAudit = GlobalMountOptions[proto.EnableAudit].GetBool()
 	opt.RequestTimeout = GlobalMountOptions[proto.RequestTimeout].GetInt64()
 	opt.ClientOpTimeOut = GlobalMountOptions[proto.ClientOpTimeOut].GetInt64()

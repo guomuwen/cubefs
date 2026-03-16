@@ -84,7 +84,7 @@ func (pc *pathCache) remove(key string) {
 
 const (
 	fdCacheShards      = 32
-	fdCacheMaxPerShard = 32768 // 32 shards × 32768 = ~1M total FDs, covers 1M files/node
+	fdCacheMaxPerShard = 131072 // 32 shards × 131072 = ~4M total FDs, covers 3M+ files
 )
 
 // fdCacheEntry holds a file descriptor and its LRU linked list element.
