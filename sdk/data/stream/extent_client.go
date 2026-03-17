@@ -136,6 +136,7 @@ type ExtentConfig struct {
 	InnerReq          bool
 	BcacheDir         string
 	MaxStreamerLimit  int64
+	ExtentCachePoolSize  int64
 	VerReadSeq        uint64
 	MetaWrapper       *meta.MetaWrapper
 	OnAppendExtentKey AppendExtentKeyFunc
@@ -185,6 +186,8 @@ type ExtentClient struct {
 	streamerList       *list.List
 	streamerLock       sync.Mutex
 	maxStreamerLimit   int
+	extentCachePool    map[uint64]*ExtentCache // survives Streamer eviction to avoid getExtents on re-open
+	extentCachePoolLimit int                     // independent cap for extentCachePool size
 	readLimiter        *rate.Limiter
 	writeLimiter       *rate.Limiter
 	disableMetaCache   bool
@@ -264,8 +267,38 @@ func (client *ExtentClient) evictStreamer() bool {
 		return true
 	}
 
+	// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+	client.saveExtentCache(s.inode, s.extents)
 	delete(s.client.streamers, s.inode)
 	return true
+}
+
+// TakeExtentCache retrieves and removes a cached ExtentCache from the pool.
+// Must be called under streamerLock protection.
+func (client *ExtentClient) TakeExtentCache(inode uint64) *ExtentCache {
+	if ec, ok := client.extentCachePool[inode]; ok {
+		delete(client.extentCachePool, inode)
+		return ec
+	}
+	return nil
+}
+
+// saveExtentCache stores an ExtentCache in the pool if it has valid data.
+// Enforces a size limit equal to extentCachePoolLimit to prevent unbounded memory growth.
+// Must be called under streamerLock protection.
+func (client *ExtentClient) saveExtentCache(inode uint64, ec *ExtentCache) {
+	if ec == nil || ec.gen == 0 {
+		return
+	}
+	// Skip if pool is disabled (maxStreamerLimit not set)
+	if client.extentCachePoolLimit <= 0 {
+		return
+	}
+	// Enforce size limit: if pool is full, skip saving (simple strategy, no LRU needed)
+	if len(client.extentCachePool) >= client.extentCachePoolLimit {
+		return
+	}
+	client.extentCachePool[inode] = ec
 }
 
 func (client *ExtentClient) batchEvictStramer(batchCnt int) {
@@ -332,6 +365,7 @@ retry:
 	}
 
 	client.streamers = make(map[uint64]*Streamer)
+	client.extentCachePool = make(map[uint64]*ExtentCache)
 	client.multiVerMgr = &MultiVerMgr{verList: &proto.VolVersionInfoList{}}
 
 	client.appendExtentKey = config.OnAppendExtentKey
@@ -400,6 +434,17 @@ retry:
 		client.disableMetaCache = true
 	}
 
+
+	// Set extentCachePoolLimit: independent of maxStreamerLimit
+	if config.ExtentCachePoolSize > 0 {
+		client.extentCachePoolLimit = int(config.ExtentCachePoolSize)
+	} else {
+		// Default: same as maxStreamerLimit for backward compatibility
+		client.extentCachePoolLimit = client.maxStreamerLimit
+	}
+	if client.extentCachePoolLimit > 0 {
+		log.LogInfof("extent cache pool limit %d", client.extentCachePoolLimit)
+	}
 	client.stopCh = make(chan struct{})
 	client.metaWrapper = config.MetaWrapper
 
@@ -512,6 +557,11 @@ func (client *ExtentClient) OpenStream(inode uint64, openForWrite, isCache bool,
 	s, ok := client.streamers[inode]
 	if !ok {
 		s = NewStreamer(client, inode, openForWrite, isCache, fullPath)
+		// Restore cached extent metadata from pool to avoid getExtents RPC on re-open
+		if cached := client.TakeExtentCache(inode); cached != nil {
+			s.extents = cached
+			log.LogDebugf("action[OpenStream] restored extentCache from pool for ino(%v)", inode)
+		}
 		client.streamers[inode] = s
 		log.LogDebugf("action[OpenStream] create new streamer for ino(%v) %p", inode, s)
 	} else {
@@ -535,6 +585,11 @@ func (client *ExtentClient) OpenStreamRdonly(inode uint64, rdonly bool, fullPath
 	s, ok := client.streamers[inode]
 	if !ok {
 		s = NewStreamer(client, inode, false, false, fullPath)
+		// Restore cached extent metadata from pool to avoid getExtents RPC on re-open
+		if cached := client.TakeExtentCache(inode); cached != nil {
+			s.extents = cached
+			log.LogDebugf("action[OpenStreamRdonly] restored extentCache from pool for ino(%v)", inode)
+		}
 		client.streamers[inode] = s
 		s.rdonly = rdonly
 	}
@@ -560,6 +615,11 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 	s, ok := client.streamers[inode]
 	if !ok {
 		s = NewStreamer(client, inode, openForWrite, isCache, fullPath)
+		// Restore cached extent metadata from pool to avoid getExtents RPC on re-open
+		if cached := client.TakeExtentCache(inode); cached != nil {
+			s.extents = cached
+			log.LogDebugf("action[OpenStreamWithCache] restored extentCache from pool for ino(%v)", inode)
+		}
 		client.streamers[inode] = s
 		if !client.disableMetaCache && needBCache {
 			client.streamerList.PushFront(inode)
@@ -572,12 +632,14 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 	s.needBCache = needBCache
 	if !s.isOpen && !client.disableMetaCache {
 		s.isOpen = true
-		log.LogDebugf("open stream again, ino(%v)", s.inode)
+		log.LogDebugf("open stream again, ino(%v) openForWrite(%v)", s.inode, s.openForWrite)
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
 		go s.asyncBlockCache()
-		go s.asyncFlushManager()
+		if s.openForWrite {
+			go s.asyncFlushManager()
+		}
 	}
 	return s.IssueOpenRequest()
 }
@@ -622,6 +684,8 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 		}
 
 		if s.client.disableMetaCache || !s.needBCache {
+			// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+			client.saveExtentCache(s.inode, s.extents)
 			delete(s.client.streamers, s.inode)
 		}
 		return nil
@@ -635,6 +699,8 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 		s.done <- struct{}{}
 		s.isOpen = false
 	} else {
+		// Preserve ExtentCache so re-opened Streamers skip getExtents RPC
+		client.saveExtentCache(s.inode, s.extents)
 		delete(s.client.streamers, s.inode)
 		s.client.streamerLock.Unlock()
 	}
@@ -904,7 +970,9 @@ func (client *ExtentClient) GetStreamer(inode uint64) *Streamer {
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
 		go s.asyncBlockCache()
-		go s.asyncFlushManager()
+		if s.openForWrite {
+			go s.asyncFlushManager()
+		}
 
 		if client.AheadRead != nil && s.aheadReadWindow != nil {
 			go s.aheadReadWindow.backgroundAheadReadTask()

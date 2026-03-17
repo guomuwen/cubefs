@@ -66,6 +66,7 @@ const (
 	MetaSendTimeout
 	BuffersTotalLimit
 	MaxStreamerLimit
+	ExtentCachePoolSize
 	EnableAudit
 
 	LocallyProf
@@ -182,6 +183,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[BuffersTotalLimit] = MountOption{"buffersTotalLimit", "Send/Receive packets memory limit", "", int64(32768)} // default 4G
 	opts[BufferChanSize] = MountOption{"buffersChanSize", "Send/Receive buffer chan size", "", int64(256)}            // default 256
 	opts[MaxStreamerLimit] = MountOption{"maxStreamerLimit", "The maximum number of streamers", "", int64(0)}         // default 0
+	opts[ExtentCachePoolSize] = MountOption{"extentCachePoolSize", "The maximum size of extent cache pool (0=same as maxStreamerLimit)", "", int64(0)} // default 0
 	opts[BcacheFilterFiles] = MountOption{"bcacheFilterFiles", "The block cache filter files suffix", "", "py;pyx;sh;yaml;conf;pt;pth;log;out"}
 	opts[BcacheBatchCnt] = MountOption{"bcacheBatchCnt", "The block cache get meta count", "", int64(100000)}
 	opts[BcacheCheckIntervalS] = MountOption{"bcacheCheckIntervalS", "The block cache check interval", "", int64(300)}
@@ -367,6 +369,7 @@ type MountOptions struct {
 	BuffersTotalLimit       int64
 	BufferChanSize          int64
 	MaxStreamerLimit        int64
+	ExtentCachePoolSize    int64
 	EnableAudit             bool
 	RequestTimeout          int64
 	ClientOpTimeOut         int64

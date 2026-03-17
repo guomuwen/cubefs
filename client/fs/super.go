@@ -244,6 +244,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		BcacheEnable:      opt.EnableBcache,
 		BcacheDir:         opt.BcacheDir,
 		MaxStreamerLimit:  opt.MaxStreamerLimit,
+		ExtentCachePoolSize: opt.ExtentCachePoolSize,
 		VerReadSeq:        opt.VerReadSeq,
 		MetaWrapper:       s.mw,
 		OnAppendExtentKey: s.mw.AppendExtentKey,

@@ -93,6 +93,7 @@ type bcacheKey struct {
 	cacheKey     string
 	extentKey    *proto.ExtentKey
 	storageClass uint32
+	data         []byte // pre-read data to avoid re-reading from datanode
 }
 
 // NewStreamer returns a new streamer.
@@ -102,27 +103,37 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	s.inode = inode
 	s.parentInode = 0
 	s.extents = NewExtentCache(inode)
+	// Restore cached ExtentCache from pool to avoid getExtents RPC on re-open
+	if cached := client.TakeExtentCache(inode); cached != nil {
+		s.extents = cached
+		log.LogDebugf("NewStreamer: restored ExtentCache from pool for ino(%v) gen(%v)", inode, cached.gen)
+	}
 	s.request = make(chan interface{}, reqChanSize)
 	s.done = make(chan struct{})
 	s.dirtylist = NewDirtyExtentList()
 	s.isOpen = true
-	s.pendingCache = make(chan bcacheKey, 1)
 	s.verSeq = client.multiVerMgr.latestVerSeq
 	s.extents.verSeq = client.multiVerMgr.latestVerSeq
 	s.openForWrite = openForWrite
 	s.isCache = isCache
 	s.fullPath = fullPath
 
-	// Initialize async flush fields
-	s.asyncFlushCh = make(chan *AsyncFlushRequest, asyncFlushQueueSize)
-	s.asyncFlushDone = make(chan struct{})
-	s.asyncFlushSemaphore = make(chan struct{}, asyncFlushSemaphoreSize)
+	if s.openForWrite {
+		// Only allocate write-related channels for write streamers
+		s.pendingCache = make(chan bcacheKey, 1)
+		s.asyncFlushCh = make(chan *AsyncFlushRequest, asyncFlushQueueSize)
+		s.asyncFlushDone = make(chan struct{})
+		s.asyncFlushSemaphore = make(chan struct{}, asyncFlushSemaphoreSize)
+	} else {
+		// Read-only streamers: pendingCache with non-blocking send (default branch)
+		s.pendingCache = make(chan bcacheKey, 1)
+	}
 
 	// Initialize local async flush tracking map
 	// sync.Map is zero value ready, no initialization needed
 
 	if log.EnableDebug() {
-		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d", s, reqChanSize)
+		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d, openForWrite %v", s, reqChanSize, openForWrite)
 	}
 	if s.openForWrite {
 		err := s.client.forbiddenMigration(s.inode)
@@ -143,7 +154,9 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	}
 	go s.server()
 	go s.asyncBlockCache()
-	go s.asyncFlushManager() // Start async flush manager
+	if s.openForWrite {
+		go s.asyncFlushManager()
+	}
 	return s
 }
 
@@ -372,34 +385,6 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 				break
 			}
 
-			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
-				inodeInfo, err = s.client.getInodeInfo(s.inode)
-				if err != nil {
-					log.LogErrorf("Streamer read: getInodeInfo failed. ino(%v) req(%v) err(%v)", s.inode, req, err)
-					return 0, err
-				}
-				cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.PartitionId, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
-				// limit big block cache
-				if s.exceedBlockSize(req.ExtentKey.Size) && atomic.LoadInt32(&s.client.inflightL1BigBlock) > 10 {
-					// do nothing
-				} else if !s.client.bcacheOnlyForNotSSD || (s.client.bcacheOnlyForNotSSD && inodeInfo.StorageClass != proto.StorageClass_Replica_SSD) {
-					select {
-					case s.pendingCache <- bcacheKey{cacheKey: cacheKey, extentKey: req.ExtentKey}:
-						if log.EnableDebug() {
-							log.LogDebugf("action[streamer.read] blockCache send cacheKey %v for ino(%v) offset %v size %v goroutine(%v)",
-								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
-						}
-						if s.exceedBlockSize(req.ExtentKey.Size) {
-							atomic.AddInt32(&s.client.inflightL1BigBlock, 1)
-						}
-					default:
-						if log.EnableDebug() {
-							log.LogDebugf("action[streamer.read] blockCache discard cacheKey %v for ino(%v) offset %v size %v  goroutine(%v)",
-								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
-						}
-					}
-				}
-			}
 			bgTime := stat.BeginStat()
 			readBytes, err = reader.Read(req)
 			stat.EndStat("ReadFromDataNode", err, bgTime, 1)
@@ -412,6 +397,43 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 					log.LogErrorf("Stream read: ino(%v) req(%v) readBytes(%v) err(%v)", s.inode, req, readBytes, err)
 				}
 				break
+			}
+
+			// after successful datanode read, populate bcache
+			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
+				inodeInfo, err = s.client.getInodeInfo(s.inode)
+				if err != nil {
+					log.LogErrorf("Streamer read: getInodeInfo failed. ino(%v) req(%v) err(%v)", s.inode, req, err)
+					return 0, err
+				}
+				cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.PartitionId, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
+				// limit big block cache
+				if s.exceedBlockSize(req.ExtentKey.Size) && atomic.LoadInt32(&s.client.inflightL1BigBlock) > 10 {
+					// do nothing
+				} else if !s.client.bcacheOnlyForNotSSD || (s.client.bcacheOnlyForNotSSD && inodeInfo.StorageClass != proto.StorageClass_Replica_SSD) {
+					pending := bcacheKey{cacheKey: cacheKey, extentKey: req.ExtentKey, storageClass: storageClass}
+					// if request covers the full extent, pass data directly to avoid re-reading from datanode
+					if req.FileOffset == int(req.ExtentKey.FileOffset) && readBytes == int(req.ExtentKey.Size) {
+						dataCopy := make([]byte, readBytes)
+						copy(dataCopy, req.Data[:readBytes])
+						pending.data = dataCopy
+					}
+					select {
+					case s.pendingCache <- pending:
+						if log.EnableDebug() {
+							log.LogDebugf("action[streamer.read] blockCache send cacheKey %v for ino(%v) offset %v size %v hasData(%v) goroutine(%v)",
+								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, pending.data != nil, getGoid())
+						}
+						if s.exceedBlockSize(req.ExtentKey.Size) {
+							atomic.AddInt32(&s.client.inflightL1BigBlock, 1)
+						}
+					default:
+						if log.EnableDebug() {
+							log.LogDebugf("action[streamer.read] blockCache discard cacheKey %v for ino(%v) offset %v size %v goroutine(%v)",
+								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
+						}
+					}
+				}
 			}
 		}
 	}
@@ -431,42 +453,55 @@ func (s *Streamer) asyncBlockCache() {
 			ek := pending.extentKey
 			cacheKey := pending.cacheKey
 			begin := time.Now()
-			log.LogDebugf("asyncBlockCache: cacheKey=(%v) ek=(%v)", cacheKey, ek)
+			log.LogDebugf("asyncBlockCache: cacheKey=(%v) ek=(%v) hasData(%v)", cacheKey, ek, pending.data != nil)
 
-			// read full extent
 			var data []byte
-			if ek.Size == bcache.MaxBlockSize {
-				data = buf.BCachePool.Get()
+			var pooled bool
+			if pending.data != nil {
+				// use pre-read data directly, skip re-reading from datanode
+				data = pending.data
 			} else {
-				data = make([]byte, ek.Size)
-			}
-			reader, err := s.GetExtentReader(ek, pending.storageClass)
-			if err != nil {
-				log.LogErrorf("asyncBlockCache: GetExtentReader err %v", err)
-				return
-			}
-			fullReq := NewExtentRequest(int(ek.FileOffset), int(ek.Size), data, ek)
-			metric := exporter.NewTPCnt("bcache-read-cachedata")
-			readBytes, err := reader.Read(fullReq)
-			if err != nil || readBytes != len(data) {
-				metric.SetWithLabels(err, map[string]string{exporter.Vol: s.client.volumeName})
-				log.LogWarnf("asyncBlockCache: Stream read full extent error. fullReq(%v) readBytes(%v) err(%v)", fullReq, readBytes, err)
+				// read full extent from datanode (fallback for partial reads)
 				if ek.Size == bcache.MaxBlockSize {
-					buf.BCachePool.Put(data)
+					data = buf.BCachePool.Get()
+					pooled = true
+				} else {
+					data = make([]byte, ek.Size)
 				}
-				if s.exceedBlockSize(ek.Size) {
-					atomic.AddInt32(&s.client.inflightL1BigBlock, -1)
+				reader, err := s.GetExtentReader(ek, pending.storageClass)
+				if err != nil {
+					log.LogErrorf("asyncBlockCache: GetExtentReader err %v", err)
+					if pooled {
+						buf.BCachePool.Put(data)
+					}
+					if s.exceedBlockSize(ek.Size) {
+						atomic.AddInt32(&s.client.inflightL1BigBlock, -1)
+					}
+					return
 				}
-				return
+				fullReq := NewExtentRequest(int(ek.FileOffset), int(ek.Size), data, ek)
+				metric := exporter.NewTPCnt("bcache-read-cachedata")
+				readBytes, err := reader.Read(fullReq)
+				if err != nil || readBytes != len(data) {
+					metric.SetWithLabels(err, map[string]string{exporter.Vol: s.client.volumeName})
+					log.LogWarnf("asyncBlockCache: Stream read full extent error. fullReq(%v) readBytes(%v) err(%v)", fullReq, readBytes, err)
+					if pooled {
+						buf.BCachePool.Put(data)
+					}
+					if s.exceedBlockSize(ek.Size) {
+						atomic.AddInt32(&s.client.inflightL1BigBlock, -1)
+					}
+					return
+				}
+				metric.SetWithLabels(err, map[string]string{exporter.Vol: s.client.volumeName})
 			}
 			log.LogDebugf("TRACE read. read blockCache cacheKey(%v) len_buf(%v) cost %v,", cacheKey, len(data), time.Since(begin).String())
-			metric.SetWithLabels(err, map[string]string{exporter.Vol: s.client.volumeName})
 			if s.client.cacheBcache != nil {
 				begin = time.Now()
 				s.client.cacheBcache(s.client.volumeName, cacheKey, data)
-				log.LogDebugf("TRACE read. read blockCache cacheKey(%v) len_buf(%v) cost %v,", cacheKey, len(data), time.Since(begin).String())
+				log.LogDebugf("TRACE read. write blockCache cacheKey(%v) len_buf(%v) cost %v,", cacheKey, len(data), time.Since(begin).String())
 			}
-			if ek.Size == bcache.MaxBlockSize {
+			if pooled {
 				buf.BCachePool.Put(data)
 			}
 			if s.exceedBlockSize(ek.Size) {
