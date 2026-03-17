@@ -1000,6 +1000,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	}
 
 	opt.BcacheOnlyForNotSSD = GlobalMountOptions[proto.BcacheOnlyForNotSSD].GetBool()
+	opt.BcacheEncrypt = GlobalMountOptions[proto.BcacheEncrypt].GetBool()
 
 	if opt.Rdonly {
 		verReadSeq := GlobalMountOptions[proto.SnapshotReadVerSeq].GetInt64()

@@ -223,7 +223,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.writeThreads = int(opt.WriteThreads)
 
 	if s.enableBcache {
-		s.bc = bcache.NewBcacheClient()
+		s.bc = bcache.NewBcacheClientWithEncrypt(opt.BcacheEncrypt)
 	}
 
 	// Initialize warm up configurable parameters

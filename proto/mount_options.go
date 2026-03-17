@@ -78,6 +78,7 @@ const (
 	StreamRetryTimeOut
 	BufferChanSize
 	BcacheOnlyForNotSSD
+	BcacheEncrypt
 	// aheadread
 	AheadReadEnable
 	AheadReadTotalMemGB
@@ -193,6 +194,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[DisableMountSubtype] = MountOption{"disableMountSubtype", "Disable Mount Subtype", "", false}
 	opts[StreamRetryTimeOut] = MountOption{"streamRetryTimeout", "max stream retry timeout, s", "", int64(0)}
 	opts[BcacheOnlyForNotSSD] = MountOption{"enableBcacheOnlyForNotSSD", "Enable block cache only for not ssd", "", false}
+	opts[BcacheEncrypt] = MountOption{"bcacheEncrypt", "Enable block cache XOR encryption", "", true}
 
 	opts[AheadReadEnable] = MountOption{"aheadReadEnable", "enable ahead read", "", false}
 	opts[AheadReadTotalMemGB] = MountOption{"aheadReadTotalMemGB", "ahead read total mem(GB)", "", int64(10)}
@@ -351,6 +353,7 @@ type MountOptions struct {
 	EbsBlockSize            int
 	EnableBcache            bool
 	BcacheOnlyForNotSSD     bool
+	BcacheEncrypt           bool
 	BcacheDir               string
 	BcacheFilterFiles       string
 	BcacheCheckIntervalS    int64
