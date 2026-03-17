@@ -136,6 +136,7 @@ type ExtentConfig struct {
 	InnerReq          bool
 	BcacheDir         string
 	MaxStreamerLimit  int64
+	ExtentCachePoolSize  int64
 	VerReadSeq        uint64
 	MetaWrapper       *meta.MetaWrapper
 	OnAppendExtentKey AppendExtentKeyFunc
@@ -186,6 +187,7 @@ type ExtentClient struct {
 	streamerLock       sync.Mutex
 	maxStreamerLimit   int
 	extentCachePool    map[uint64]*ExtentCache // survives Streamer eviction to avoid getExtents on re-open
+	extentCachePoolLimit int                     // independent cap for extentCachePool size
 	readLimiter        *rate.Limiter
 	writeLimiter       *rate.Limiter
 	disableMetaCache   bool
@@ -282,18 +284,18 @@ func (client *ExtentClient) TakeExtentCache(inode uint64) *ExtentCache {
 }
 
 // saveExtentCache stores an ExtentCache in the pool if it has valid data.
-// Enforces a size limit equal to maxStreamerLimit to prevent unbounded memory growth.
+// Enforces a size limit equal to extentCachePoolLimit to prevent unbounded memory growth.
 // Must be called under streamerLock protection.
 func (client *ExtentClient) saveExtentCache(inode uint64, ec *ExtentCache) {
 	if ec == nil || ec.gen == 0 {
 		return
 	}
 	// Skip if pool is disabled (maxStreamerLimit not set)
-	if client.maxStreamerLimit <= 0 {
+	if client.extentCachePoolLimit <= 0 {
 		return
 	}
 	// Enforce size limit: if pool is full, skip saving (simple strategy, no LRU needed)
-	if len(client.extentCachePool) >= client.maxStreamerLimit {
+	if len(client.extentCachePool) >= client.extentCachePoolLimit {
 		return
 	}
 	client.extentCachePool[inode] = ec
@@ -432,6 +434,17 @@ retry:
 		client.disableMetaCache = true
 	}
 
+
+	// Set extentCachePoolLimit: independent of maxStreamerLimit
+	if config.ExtentCachePoolSize > 0 {
+		client.extentCachePoolLimit = int(config.ExtentCachePoolSize)
+	} else {
+		// Default: same as maxStreamerLimit for backward compatibility
+		client.extentCachePoolLimit = client.maxStreamerLimit
+	}
+	if client.extentCachePoolLimit > 0 {
+		log.LogInfof("extent cache pool limit %d", client.extentCachePoolLimit)
+	}
 	client.stopCh = make(chan struct{})
 	client.metaWrapper = config.MetaWrapper
 
@@ -608,8 +621,8 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
+		go s.asyncBlockCache()
 		if s.openForWrite {
-			go s.asyncBlockCache()
 			go s.asyncFlushManager()
 		}
 	}
@@ -941,8 +954,8 @@ func (client *ExtentClient) GetStreamer(inode uint64) *Streamer {
 		s.request = make(chan interface{}, reqChanSize)
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
+		go s.asyncBlockCache()
 		if s.openForWrite {
-			go s.asyncBlockCache()
 			go s.asyncFlushManager()
 		}
 
