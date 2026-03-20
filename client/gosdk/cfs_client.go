@@ -983,7 +983,7 @@ func (c *Client) openStream(f *File, openForWrite bool, fullPath string) {
 	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
 		isCache = true
 	}
-	_ = c.ec.OpenStream(f.ino, openForWrite, isCache, fullPath)
+	_ = c.ec.OpenStreamWithCache(f.ino, c.cfg.EnableBcache, openForWrite, isCache, fullPath)
 }
 
 func (c *Client) closeStream(f *File) error {
