@@ -49,6 +49,8 @@ fdstore:
 bcache:
 	@build/build.sh bcache $(GOMOD) --threads=$(threads)
 
+libsdk_bench:
+	@build/build.sh libsdk_bench $(GOMOD) --threads=$(threads)
 rctest:
 	@build/build.sh rctest $(GOMOD) --threads=$(threads)
 

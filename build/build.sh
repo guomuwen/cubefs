@@ -556,6 +556,13 @@ build_rctest(){
     popd >/dev/null
 }
 
+build_libsdk_bench(){
+    pushd $SrcPath >/dev/null
+    echo -n "build libsdk-bench      "
+    CGO_ENABLED=1 go build ${MODFLAGS} -gcflags=all=-trimpath=${SrcPath} -asmflags=all=-trimpath=${SrcPath} -ldflags="${LDFlags}" -o ${BuildBinPath}/libsdk-bench ${SrcPath}/cmd/libsdk_bench/*.go  && echo "success" || echo "failed"
+    popd >/dev/null
+}
+
 build_rcconfig(){
     pushd $SrcPath >/dev/null
     echo -n "build cfs-remotecache-config      "
@@ -678,6 +685,9 @@ case "$cmd" in
         ;;
     "rcconfig")
         build_rcconfig
+        ;;
+    "libsdk_bench")
+        build_libsdk_bench
         ;;
     *)
         ;;
