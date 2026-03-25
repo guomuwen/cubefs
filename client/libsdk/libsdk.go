@@ -256,6 +256,8 @@ type client struct {
 	volType                int
 	ebsBlockSize           int
 	enableBcache           bool
+	bcacheDirs             []string
+	bcacheEncrypt          bool
 	readBlockThread        int
 	writeBlockThread       int
 	secretKey              string
@@ -562,6 +564,12 @@ func cfs_set_client(id C.int64_t, key, val *C.char) C.int {
 		} else {
 			c.enableBcache = false
 		}
+	case "bcacheDirs":
+		if v != "" {
+			c.bcacheDirs = strings.Split(v, ";")
+		}
+	case "bcacheEncrypt":
+		c.bcacheEncrypt = v == "true"
 	case "readBlockThread":
 		rt, err := strconv.Atoi(v)
 		if err == nil {
@@ -1512,7 +1520,11 @@ func (c *client) start() (err error) {
 	}
 
 	if c.enableBcache {
-		c.bc = bcache.NewBcacheClient()
+		if len(c.bcacheDirs) > 0 {
+			c.bc = bcache.NewBcacheClientWithLocalPath(c.bcacheEncrypt, c.bcacheDirs)
+		} else {
+			c.bc = bcache.NewBcacheClientWithEncrypt(c.bcacheEncrypt)
+		}
 	}
 	var ebsc *blobstore.BlobStoreClient
 	if c.ebsEndpoint != "" {
@@ -1560,7 +1572,8 @@ func (c *client) start() (err error) {
 		OnLoadBcache:                c.bc.Get,
 		OnCacheBcache:               c.bc.Put,
 		OnEvictBcache:               c.bc.Evict,
-		DisableMetaCache:            true,
+		OnGetInodeInfo:              mw.InodeGet_ll,
+		DisableMetaCache:            !c.enableBcache,
 		VolStorageClass:             c.volStorageClass,
 		VolAllowedStorageClass:      c.volAllowedStorageClass,
 		OnRenewalForbiddenMigration: mw.RenewalForbiddenMigration,
@@ -1749,7 +1762,11 @@ func (c *client) openStream(f *file, fullPath string) {
 	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
 		isCache = true
 	}
-	_ = c.ec.OpenStream(f.ino, f.openForWrite, isCache, fullPath)
+	if c.enableBcache {
+		_ = c.ec.OpenStreamWithCache(f.ino, true, f.openForWrite, isCache, fullPath)
+	} else {
+		_ = c.ec.OpenStream(f.ino, f.openForWrite, isCache, fullPath)
+	}
 }
 
 func (c *client) closeStream(f *file) {
