@@ -16,10 +16,14 @@ package bcache
 
 import (
 	"container/list"
+	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/blobstore/util/bytespool"
@@ -175,10 +179,13 @@ func (fc *fdCache) evict(cachePath string) {
 }
 
 type BcacheClient struct {
-	connPool  *ConnPool
-	pathCache *pathCache
-	fdCache   *fdCache
-	encrypt   bool
+	connPool         *ConnPool
+	pathCache        *pathCache
+	fdCache          *fdCache
+	encrypt          bool
+	cacheDirs        []string // local cache directories for IPC-bypass mode
+	localPathEnabled bool     // when true, compute cache path locally instead of IPC
+	indexReady       int32    // atomic: 1 when startup scan is complete
 }
 
 var (
@@ -204,6 +211,98 @@ func NewBcacheClientWithEncrypt(encrypt bool) *BcacheClient {
 	return client
 }
 
+// NewBcacheClientWithLocalPath creates a bcache client that bypasses IPC for reads.
+// It computes cache file paths locally using the same algorithm as bcache-server,
+// eliminating the Unix socket round-trip latency (~0.3ms per read).
+// cacheDirs should match the bcache-server cacheDir config (e.g., "/bcache0:/bcache1:...").
+// Put and Evict operations still go through IPC to keep bcache-server's LRU consistent.
+func NewBcacheClientWithLocalPath(encrypt bool, cacheDirs []string) *BcacheClient {
+	once.Do(func() {
+		expireTime := int64(time.Second * ConnectExpireTime)
+		cp := NewConnPool(UnixSocketPath, 20, 200, expireTime)
+		client = &BcacheClient{
+			connPool:         cp,
+			pathCache:        newPathCache(),
+			fdCache:          newFdCache(),
+			encrypt:          encrypt,
+			cacheDirs:        cacheDirs,
+			localPathEnabled: len(cacheDirs) > 0,
+		}
+		if client.localPathEnabled {
+			client.scanCacheDirs()
+		}
+	})
+	return client
+}
+
+// scanCacheDirs walks all bcache directories to build the key→path index.
+// This eliminates per-read directory probing (open() on non-existent paths)
+// that causes 100% disk utilization from metadata I/O storms.
+func (c *BcacheClient) scanCacheDirs() {
+	startTime := time.Now()
+	var totalKeys int64
+
+	// Scan each cache dir in parallel
+	var wg sync.WaitGroup
+	for _, dir := range c.cacheDirs {
+		blocksDir := filepath.Join(dir, "blocks")
+		wg.Add(1)
+		go func(bd string) {
+			defer wg.Done()
+			count := c.scanOneDir(bd)
+			atomic.AddInt64(&totalKeys, count)
+		}(blocksDir)
+	}
+	wg.Wait()
+
+	atomic.StoreInt32(&c.indexReady, 1)
+	elapsed := time.Since(startTime)
+	fmt.Printf("[bcache] Index scan complete: %d keys indexed from %d dirs in %v\n",
+		totalKeys, len(c.cacheDirs), elapsed)
+}
+
+// scanOneDir walks a single /bcacheX/blocks/ directory tree and indexes all cache files.
+func (c *BcacheClient) scanOneDir(blocksDir string) int64 {
+	var count int64
+
+	// Structure: blocksDir/subDir1/subDir2/cacheKey
+	// Use raw directory reading for speed instead of filepath.Walk
+	subDir1List, err := os.ReadDir(blocksDir)
+	if err != nil {
+		return 0
+	}
+	for _, sd1 := range subDir1List {
+		if !sd1.IsDir() {
+			continue
+		}
+		sd1Path := filepath.Join(blocksDir, sd1.Name())
+		subDir2List, err := os.ReadDir(sd1Path)
+		if err != nil {
+			continue
+		}
+		for _, sd2 := range subDir2List {
+			if !sd2.IsDir() {
+				continue
+			}
+			sd2Path := filepath.Join(sd1Path, sd2.Name())
+			files, err := os.ReadDir(sd2Path)
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if f.IsDir() {
+					continue
+				}
+				key := f.Name()
+				fullPath := filepath.Join(sd2Path, key)
+				c.pathCache.put(key, fullPath)
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func (c *BcacheClient) Get(vol, key string, buf []byte, offset uint64, size uint32) (int, error) {
 	var err error
 	bgTime := stat.BeginStat()
@@ -211,6 +310,36 @@ func (c *BcacheClient) Get(vol, key string, buf []byte, offset uint64, size uint
 		stat.EndStat("bcache-get", err, bgTime, 1)
 	}()
 
+	// Fast path: local path computation (IPC-bypass mode)
+	if c.localPathEnabled {
+		// Check pathCache — after startup scan this covers all existing cache files
+		if cachePath, ok := c.pathCache.get(key); ok {
+			n, readErr := c.readCacheFile(cachePath, key, buf, offset, size)
+			if readErr == nil {
+				stat.EndStat("bcache-get-fast", nil, bgTime, 1)
+				return n, nil
+			}
+			if os.IsNotExist(readErr) {
+				c.pathCache.remove(key)
+			}
+		}
+		// Fallback: probe each dir (handles files written after startup scan)
+		subPath := c.computeLocalSubPath(key)
+		for _, dir := range c.cacheDirs {
+			cachePath := dir + subPath
+			n, readErr := c.readCacheFile(cachePath, key, buf, offset, size)
+			if readErr == nil {
+				c.pathCache.put(key, cachePath)
+				stat.EndStat("bcache-get-fast", nil, bgTime, 1)
+				return n, nil
+			}
+		}
+		// All dirs miss
+		err = os.ErrNotExist
+		return 0, err
+	}
+
+	// Standard path: pathCache + IPC fallback
 	if cachePath, ok := c.pathCache.get(key); ok {
 		n, readErr := c.readCacheFile(cachePath, key, buf, offset, size)
 		if readErr == nil {
@@ -235,6 +364,30 @@ func (c *BcacheClient) Get(vol, key string, buf []byte, offset uint64, size uint
 	readCacheMetric.SetWithLabels(err, map[string]string{exporter.Vol: vol})
 	stat.EndStat("bcache-get-read", err, readBgTime, 1)
 	return n, err
+}
+
+// computeLocalSubPath computes the sub-path portion of a bcache file path
+// (everything after the cache dir prefix), using the same algorithm as
+// bcache-server's DiskStore.buildCachePath.
+// Returns a string like "/blocks/102/272/ltptest_35045648_26_41_0000000000000000"
+func (c *BcacheClient) computeLocalSubPath(key string) string {
+	hash := crc32.ChecksumIEEE([]byte(key))
+	subDir1 := hash & 0xFFF % 512
+
+	// Extract inodeId from key format: "volName_inodeId_dpId_extentId_fileOffset"
+	parts := strings.SplitN(key, "_", 3)
+	var subDir2 uint64
+	if len(parts) >= 2 {
+		if inodeId, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+			subDir2 = inodeId % 512
+		} else {
+			subDir2 = uint64(hash) % 512
+		}
+	} else {
+		subDir2 = uint64(hash) % 512
+	}
+
+	return "/blocks/" + strconv.FormatUint(uint64(subDir1), 10) + "/" + strconv.FormatUint(subDir2, 10) + "/" + key
 }
 
 func (c *BcacheClient) readCacheFile(cachePath, key string, buf []byte, offset uint64, size uint32) (int, error) {
