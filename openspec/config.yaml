@@ -1,20 +1,79 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  ## 项目概述
+  CubeFS（储宝）— CNCF 毕业级云原生分布式文件与对象存储系统。
+  当前工作聚焦于 AI 训练 I/O 加速，通过 libsdk（gosdk）绕过 FUSE 内核态开销提升读带宽。
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  ## 技术栈
+  - 核心语言：Go 1.18+（服务端、SDK、FUSE client）
+  - C/CGO：libcfs.so（Go→C 共享库）、LD_PRELOAD 拦截层
+  - Python：DLIO benchmark、TensorFlow tf.data、MPI (mpi4py)
+  - 构建工具：Makefile、go build、CGO_ENABLED=1
+  - 依赖：jacobsa/fuse、gorocksdb、sarama (Kafka)、aws-sdk-go (S3)
+
+  ## 项目架构
+  CubeFS 采用分布式架构，核心组件：
+  - master/       — 集群管理节点（卷/分区/节点管理、调度）
+  - metanode/     — 元数据节点（inode、dentry、元数据分区）
+  - datanode/     — 数据节点（extent 存储、副本/纠删码）
+  - objectnode/   — 对象存储网关（S3 兼容 API）
+  - blobstore/    — 纠删码子系统（BlobNode、ClusterMgr、Access）
+  - client/       — 客户端（FUSE 挂载、gosdk、libsdk、blockcache）
+  - sdk/          — SDK 层（data/stream、meta、master、auth）
+  - proto/        — 协议定义（RPC 报文、元数据结构、挂载选项）
+  - lcnode/       — 生命周期管理节点
+  - remotecache/  — 远程缓存（FlashNode）
+  - authnode/     — 认证节点
+
+  ## 客户端分层结构
+  client/fuse.go        → FUSE 挂载入口（内核态 VFS 接入）
+  client/fs/            → 文件系统语义层（Super、Inode、Dentry Cache）
+  client/gosdk/         → Go SDK 封装（Config→Client→File，纯用户态）
+  client/libsdk/        → C API 导出（libsdk.go→libcfs.so，通过 CGO）
+  client/blockcache/    → 本地 SSD 缓存（bcache，IPC / IPC-bypass 模式）
+  sdk/data/stream/      → 数据流层（ExtentClient、Streamer、Reader/Writer）
+  sdk/meta/             → 元数据 SDK（MetaWrapper、InodeCache、DentryCache）
+
+  ## 访问协议
+  - POSIX（通过 FUSE 或 libsdk）
+  - HDFS（通过 Java SDK）
+  - S3（通过 ObjectNode）
+  - REST API（管理接口）
+
+  ## 当前开发环境
+  - 测试集群：3 节点（7.32.209.204/205/206），ltptest 卷
+  - bcache SSD：每节点 5 块（/bcache0 ~ /bcache4）
+  - 已验证性能：libsdk 模式 ~15,000 IOPS / ~1,500 MB/s（vs FUSE ~10,260 IOPS / ~800 MB/s）
+  - 目标场景：DLIO benchmark（MLPerf I/O），300万文件，MPI 24进程 × 16线程
+
+  ## 代码规范
+  - Go 标准库风格，包名小写，接口命名 -er 后缀
+  - C 代码遵循 POSIX 标准，函数命名 cfs_ 前缀
+  - Commit message 格式：type(scope): description（如 feat(bcache): ...）
+  - 错误处理：Go 侧返回 error，C 侧返回负数错误码
+  - 日志：使用 cubefs/util/log 包，分级 Debug/Info/Warn/Error
+
+rules:
+  proposal:
+    - 使用中文撰写，清晰说明业务背景和技术动机
+    - 必须包含性能数据对比（如 FUSE vs libsdk 的 IOPS/带宽）
+    - 影响范围需明确列出涉及的节点类型和组件路径
+    - Capabilities 中每个能力名使用 kebab-case，需与实际代码模块对应
+  design:
+    - 使用中文撰写，包含 ASCII 架构图说明数据流和组件关系
+    - 遵循 CubeFS 分层架构（client → sdk → proto），不跨层直接调用
+    - 新增组件需说明与现有 libcfs.so C API 的接口关系
+    - 线程安全性、多进程隔离、fd 空间管理等并发问题必须明确设计
+    - 需包含错误处理策略和降级方案
+  specs:
+    - 使用中文撰写，需求用 MUST/SHOULD/MAY 分级
+    - 每个 spec 聚焦单一能力，避免跨 spec 的功能耦合
+    - 需要列出该能力涉及的所有 POSIX API 和对应的 CubeFS C API 映射
+    - 性能要求需给出具体数值（如延迟、IOPS、带宽下限）
+  tasks:
+    - 使用中文描述，每个任务聚焦单一关注点
+    - 按依赖关系排序，前置任务在前
+    - 明确列出需要新建或修改的文件路径
+    - 包含编译命令和基本验证步骤
+    - 涉及多节点部署的任务需注明节点列表和分发方式
