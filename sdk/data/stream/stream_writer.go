@@ -229,17 +229,21 @@ func (s *Streamer) server() {
 		case <-s.done:
 			s.abort()
 			// Clean up async flush system
-			select {
-			case <-s.asyncFlushDone:
-				// Channel already closed, do nothing
-			default:
-				close(s.asyncFlushDone)
+			if s.asyncFlushDone != nil {
+				select {
+				case <-s.asyncFlushDone:
+					// Channel already closed, do nothing
+				default:
+					close(s.asyncFlushDone)
+				}
 			}
-			select {
-			case <-s.asyncFlushCh:
-				// Channel already closed, do nothing
-			default:
-				close(s.asyncFlushCh) // Close the channel to signal asyncFlushManager to stop
+			if s.asyncFlushCh != nil {
+				select {
+				case <-s.asyncFlushCh:
+					// Channel already closed, do nothing
+				default:
+					close(s.asyncFlushCh) // Close the channel to signal asyncFlushManager to stop
+				}
 			}
 			log.LogDebugf("done server: evict, streamer(%v)", s)
 			return
@@ -1245,19 +1249,23 @@ func (s *Streamer) evict() error {
 	}
 
 	// Signal async flush operations to stop accepting new requests
-	select {
-	case <-s.asyncFlushDone:
-		// Channel already closed, do nothing
-	default:
-		close(s.asyncFlushDone)
+	if s.asyncFlushDone != nil {
+		select {
+		case <-s.asyncFlushDone:
+			// Channel already closed, do nothing
+		default:
+			close(s.asyncFlushDone)
+		}
 	}
 
 	// Now safe to close the async flush channel
-	select {
-	case <-s.asyncFlushCh:
-		// Channel already closed, do nothing
-	default:
-		close(s.asyncFlushCh)
+	if s.asyncFlushCh != nil {
+		select {
+		case <-s.asyncFlushCh:
+			// Channel already closed, do nothing
+		default:
+			close(s.asyncFlushCh)
+		}
 	}
 
 	return nil
@@ -1276,19 +1284,23 @@ func (s *Streamer) abort() {
 	}
 
 	// Signal async flush operations to stop accepting new requests
-	select {
-	case <-s.asyncFlushDone:
-		// Channel already closed, do nothing
-	default:
-		close(s.asyncFlushDone)
+	if s.asyncFlushDone != nil {
+		select {
+		case <-s.asyncFlushDone:
+			// Channel already closed, do nothing
+		default:
+			close(s.asyncFlushDone)
+		}
 	}
 
 	// Now safe to close the async flush channel
-	select {
-	case <-s.asyncFlushCh:
-		// Channel already closed, do nothing
-	default:
-		close(s.asyncFlushCh)
+	if s.asyncFlushCh != nil {
+		select {
+		case <-s.asyncFlushCh:
+			// Channel already closed, do nothing
+		default:
+			close(s.asyncFlushCh)
+		}
 	}
 
 	for {

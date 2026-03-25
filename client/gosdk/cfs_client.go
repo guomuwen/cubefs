@@ -48,14 +48,19 @@ type (
 		AccessKey  string `json:"accessKey"`
 		SecretKey  string `json:"secretKey"`
 
-		FollowerRead     bool   `json:"followerRead,omitempty"`
-		EnableBcache     bool   `json:"enableBcache,omitempty"`
-		EnableAudit      bool   `json:"enableAudit,omitempty"`
-		ReadBlockThread  int    `json:"readBlockThread,omitempty"`
-		WriteBlockThread int    `json:"writeBlockThread,omitempty"`
-		LogDir           string `json:"logDir,omitempty"`
-		LogLevel         string `json:"logLevel,omitempty"`
-		PushAddr         string `json:"pushAddr,omitempty"`
+		FollowerRead        bool   `json:"followerRead,omitempty"`
+		NearRead            bool   `json:"nearRead,omitempty"`
+		EnableBcache        bool   `json:"enableBcache,omitempty"`
+		BcacheEncrypt       bool   `json:"bcacheEncrypt,omitempty"`
+		BcacheDirs          string `json:"bcacheDirs,omitempty"` // semicolon-separated cache dirs for IPC-bypass, e.g. "/bcache0;/bcache1"
+		EnableAudit         bool   `json:"enableAudit,omitempty"`
+		ReadBlockThread     int    `json:"readBlockThread,omitempty"`
+		WriteBlockThread    int    `json:"writeBlockThread,omitempty"`
+		ExtentCachePoolSize int64  `json:"extentCachePoolSize,omitempty"`
+		MaxStreamerLimit     int64  `json:"maxStreamerLimit,omitempty"`
+		LogDir              string `json:"logDir,omitempty"`
+		LogLevel            string `json:"logLevel,omitempty"`
+		PushAddr            string `json:"pushAddr,omitempty"`
 	}
 
 	Client struct {
@@ -220,7 +225,13 @@ func (c *Client) Start() (err error) {
 	}
 
 	if c.cfg.EnableBcache {
-		c.bc = bcache.NewBcacheClient()
+		if c.cfg.BcacheDirs != "" {
+			dirs := strings.Split(c.cfg.BcacheDirs, ";")
+			c.bc = bcache.NewBcacheClientWithLocalPath(c.cfg.BcacheEncrypt, dirs)
+			log.LogInfof("bcache IPC-bypass mode enabled with %d cache dirs", len(dirs))
+		} else {
+			c.bc = bcache.NewBcacheClientWithEncrypt(c.cfg.BcacheEncrypt)
+		}
 	}
 	var ebsc *blobstore.BlobStoreClient
 	if c.ebsEndpoint != "" {
@@ -255,10 +266,19 @@ func (c *Client) Start() (err error) {
 		return err
 	}
 	var ec *stream.ExtentClient
+	maxStreamerLimit := c.cfg.MaxStreamerLimit
+	if maxStreamerLimit <= 0 {
+		maxStreamerLimit = 500000
+	}
+	extentCachePoolSize := c.cfg.ExtentCachePoolSize
+	if extentCachePoolSize <= 0 {
+		extentCachePoolSize = 3200000
+	}
 	if ec, err = stream.NewExtentClient(&stream.ExtentConfig{
 		Volume:                      c.cfg.VolName,
 		Masters:                     masters,
 		FollowerRead:                c.cfg.FollowerRead,
+		NearRead:                    c.cfg.NearRead,
 		OnAppendExtentKey:           mw.AppendExtentKey,
 		OnGetExtents:                mw.GetExtents,
 		OnTruncate:                  mw.Truncate,
@@ -266,11 +286,14 @@ func (c *Client) Start() (err error) {
 		OnLoadBcache:                c.bc.Get,
 		OnCacheBcache:               c.bc.Put,
 		OnEvictBcache:               c.bc.Evict,
-		DisableMetaCache:            true,
+		DisableMetaCache:            false,
+		MaxStreamerLimit:             maxStreamerLimit,
+		ExtentCachePoolSize:         extentCachePoolSize,
 		VolStorageClass:             c.volStorageClass,
 		VolAllowedStorageClass:      c.volAllowedStorageClass,
 		OnRenewalForbiddenMigration: mw.RenewalForbiddenMigration,
 		OnForbiddenMigration:        mw.ForbiddenMigration,
+		OnGetInodeInfo:              c.inodeGet,
 		MetaWrapper:                 mw,
 	}); err != nil {
 		log.LogErrorf("newClient NewExtentClient failed(%v)", err)
@@ -281,6 +304,21 @@ func (c *Client) Start() (err error) {
 	c.ec = ec
 	c.ebsc = ebsc
 	return nil
+}
+
+// inodeGet returns inode info with InodeCache acceleration.
+// It first checks the local InodeCache, and falls back to meta RPC on miss.
+func (c *Client) inodeGet(ino uint64) (*proto.InodeInfo, error) {
+	info := c.ic.Get(ino)
+	if info != nil {
+		return info, nil
+	}
+	info, err := c.mw.InodeGet_ll(ino)
+	if err != nil {
+		return nil, err
+	}
+	c.ic.Put(info)
+	return info, nil
 }
 
 func (c *Client) Close() {
