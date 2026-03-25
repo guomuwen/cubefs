@@ -26,7 +26,9 @@ var (
 	maxFiles   = flag.Int("maxFiles", 0, "Max files to read (0 = all)")
 	epochs     = flag.Int("epochs", 5, "Number of read epochs")
 	shuffle    = flag.Bool("shuffle", true, "Shuffle file list before each epoch")
-	enableBC   = flag.Bool("bcache", true, "Enable bcache acceleration")
+	enableBC      = flag.Bool("bcache", true, "Enable bcache acceleration")
+	bcacheEncrypt = flag.Bool("bcacheEncrypt", false, "Enable bcache encryption (must match bcache-server cacheEncrypt)")
+	bcacheDirs    = flag.String("bcacheDirs", "", "Semicolon-separated bcache dirs for IPC-bypass (e.g. /bcache0;/bcache1)")
 	logDir     = flag.String("logDir", "/cfs/libsdk/log", "Log directory")
 	logLevel   = flag.String("logLevel", "error", "Log level")
 )
@@ -74,13 +76,16 @@ func main() {
 	fmt.Printf("[Init]   Bcache: %v\n", *enableBC)
 
 	cfg := gosdk.Config{
-		VolName:      *volName,
-		MasterAddr:   *masterAddr,
-		AccessKey:    *accessKey,
-		SecretKey:    *secretKey,
-		EnableBcache: *enableBC,
-		LogDir:       *logDir,
-		LogLevel:     *logLevel,
+		VolName:       *volName,
+		MasterAddr:    *masterAddr,
+		AccessKey:     *accessKey,
+		SecretKey:     *secretKey,
+		EnableBcache:  *enableBC,
+		BcacheEncrypt: *bcacheEncrypt,
+		BcacheDirs:    *bcacheDirs,
+		NearRead:      true,
+		LogDir:        *logDir,
+		LogLevel:      *logLevel,
 	}
 
 	client := gosdk.New(cfg)
@@ -211,34 +216,48 @@ func main() {
 }
 
 func listFiles(client *gosdk.Client, dir string, max int) ([]string, error) {
-	dirFile, err := client.OpenFile(dir, syscall.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open dir %s: %v", dir, err)
-	}
-	defer dirFile.CloseFile()
-
 	var files []string
-	batchSize := 10000
-	for {
-		entries, err := dirFile.Readdir(batchSize)
+	var walkDir func(string) error
+	walkDir = func(d string) error {
+		dirFile, err := client.OpenFile(d, syscall.O_RDONLY, 0)
 		if err != nil {
-			return nil, fmt.Errorf("readdir %s: %v", dir, err)
+			return fmt.Errorf("open dir %s: %v", d, err)
 		}
-		if len(entries) == 0 {
-			break
-		}
-		for _, e := range entries {
-			if e.DType == syscall.DT_REG {
-				files = append(files, path.Join(dir, e.Name))
+		defer dirFile.CloseFile()
+
+		batchSize := 10000
+		for {
+			entries, err := dirFile.Readdir(batchSize)
+			if err != nil {
+				return fmt.Errorf("readdir %s: %v", d, err)
+			}
+			if len(entries) == 0 {
+				break
+			}
+			for _, e := range entries {
+				if max > 0 && len(files) >= max {
+					return nil
+				}
+				fullPath := path.Join(d, e.Name)
+				if e.DType == syscall.DT_REG {
+					files = append(files, fullPath)
+				} else if e.DType == syscall.DT_DIR {
+					if err := walkDir(fullPath); err != nil {
+						return err
+					}
+				}
+			}
+			if len(entries) < batchSize {
+				break
 			}
 		}
-		if max > 0 && len(files) >= max {
-			files = files[:max]
-			break
-		}
-		if len(entries) < batchSize {
-			break
-		}
+		return nil
+	}
+	if err := walkDir(dir); err != nil {
+		return nil, err
+	}
+	if max > 0 && len(files) > max {
+		files = files[:max]
 	}
 	return files, nil
 }
